@@ -9,6 +9,7 @@ ChatGPT サブスクリプション (Codex) のバックエンドをそのまま
   - 期限 5 分前になったら事前にリフレッシュ
   - 上流が 401 を返したらリフレッシュして 1 回だけリトライ
   - ローテーションした `refresh_token` を `auth.json` に書き戻す (CLI 側と乖離しない)
+- 任意で API キー認証 (`BRIDGE_API_KEY`)。SDK が必ず送る `Authorization: Bearer` をそのまま使うので、クライアント側の実装は不要
 
 ## 必要なもの
 
@@ -26,6 +27,7 @@ cargo run --release      # http://localhost:3000
 | 変数 | 既定値 | 説明 |
 | --- | --- | --- |
 | `PORT` | `3000` | 待ち受けポート |
+| `BRIDGE_API_KEY` | (なし) | 受け付ける API キー。カンマ区切りで複数可。未設定だと **誰でも叩けます** |
 | `CODEX_AUTH_PATH` | `~/.codex/auth.json` | 認証情報ファイル |
 | `CODEX_UPSTREAM` | `https://chatgpt.com/backend-api/codex` | 転送先 |
 | `CODEX_USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` | `GET /usage` の転送先 |
@@ -38,6 +40,7 @@ cargo run --release      # http://localhost:3000
 ```sh
 curl -N http://localhost:3000/responses \
   -H 'content-type: application/json' \
+  -H "authorization: Bearer $BRIDGE_API_KEY" \
   -d '{
     "model": "gpt-5.3-codex-spark",
     "instructions": "You are a helpful assistant.",
@@ -49,7 +52,7 @@ curl -N http://localhost:3000/responses \
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:3000", api_key="unused")
+client = OpenAI(base_url="http://localhost:3000", api_key="sk-bridge-...")  # BRIDGE_API_KEY
 with client.responses.stream(
     model="gpt-5.3-codex-spark",
     instructions="You are a helpful assistant.",
@@ -60,6 +63,19 @@ with client.responses.stream(
         ...
 ```
 
+### 認証
+
+`BRIDGE_API_KEY` を設定すると、`Authorization: Bearer <key>` または `x-api-key: <key>` を付けないリクエストを `401` で弾きます。OpenAI SDK は `api_key` が必須でこのヘッダーを必ず送るので、`api_key="unused"` と書いていたところを実際のキーに変えるだけです。
+
+- ヘッダーは上流に転送されません (上流はサブスクリプションのトークンで認証するため)
+- カンマ区切りで複数指定できるので、無停止でのローテーションが可能です (新キーを追加 → クライアント移行 → 旧キーを削除)
+- キーの比較は早期 return しない定数時間比較です
+- 未設定のときは認証なしで動きます。その場合は必ずファイアウォールで接続元を絞ってください
+
+```sh
+BRIDGE_API_KEY=$(openssl rand -hex 32) cargo run --release
+```
+
 ### ブリッジ側で持っているエンドポイント
 
 上流のパスと衝突しない範囲で、以下だけ特別扱いしています。それ以外はすべてパススルーです (`/v1/...` は `/v1` を外して転送)。
@@ -67,7 +83,7 @@ with client.responses.stream(
 | エンドポイント | 説明 |
 | --- | --- |
 | `GET /usage` | `backend-api/wham/usage` へ転送。プラン・レート制限の消費率・リセット時刻がそのまま返る |
-| `GET /health` | 上流を叩かずに応答。トークンの残り有効期限・最終リフレッシュ時刻・アカウント情報 (id_token 由来) を返す。ロードバランサーのヘルスチェックや「refresh_token が死んでいないか」の監視に |
+| `GET /health` | 上流を叩かずに応答。トークンの残り有効期限・最終リフレッシュ時刻・アカウント情報 (id_token 由来) を返す。ロードバランサーのヘルスチェックや「refresh_token が死んでいないか」の監視に。**ここだけは認証なしでも 200 / 503 を返します** (ヘルスチェックにヘッダーを付けられない LB のため)。ただしキーを付けない呼び出しには `{"ok":true}` しか返さず、アカウント情報は伏せます |
 | `POST /refresh` | 強制的にトークンをリフレッシュして `/health` と同じ内容を返す (デバッグ用) |
 
 ```sh
@@ -124,7 +140,10 @@ cargo fmt              # フォーマット (rustfmt.toml: max_width = 110)
 
 EC2 `t4g.nano` (arm64) に Docker を入れて `compose.yaml` で動かすのが最も安価 (月 $5 前後) で、この設計に一番合っています。TLS 終端は Cloudflare Tunnel か Caddy を前段に置いてください。
 
+ECS (EC2 起動タイプ) に載せる場合の制約・タスク定義・`auth.json` の投入手順は [docs/deploy-ecs-ec2.md](docs/deploy-ecs-ec2.md) にまとめています (Terraform を書く LLM 向け)。
+
 ## 注意
 
 - `refresh_token` は使い捨てでローテーションします。同じ `auth.json` を複数プロセスで共有すると、片方が持つ `refresh_token` が無効化されることがあります
-- 認証機能はありません。到達できる相手は誰でもあなたのサブスクリプションを消費できるので、Security Group やファイアウォールで接続元を必ず絞ってください
+- `BRIDGE_API_KEY` を設定しない場合、到達できる相手は誰でもあなたのサブスクリプションを消費でき、`POST /refresh` でトークンをローテーションさせることもできます。外部に露出するなら必ずキーを設定し、加えて Security Group やファイアウォールで接続元を絞ってください
+- キー認証は HTTP ヘッダーの平文なので、TLS 終端 (Cloudflare Tunnel / Caddy 等) を前段に置くこと前提です

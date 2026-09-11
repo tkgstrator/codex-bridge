@@ -19,6 +19,15 @@ impl Bridge {
         file: TempFile,
         respond: impl Fn(usize, &Recorded) -> Response + Send + Sync + 'static,
     ) -> Self {
+        Self::guarded(file, Vec::new(), respond).await
+    }
+
+    /// Same, but with BRIDGE_API_KEY-style keys configured.
+    async fn guarded(
+        file: TempFile,
+        api_keys: Vec<String>,
+        respond: impl Fn(usize, &Recorded) -> Response + Send + Sync + 'static,
+    ) -> Self {
         let upstream = MockServer::start(respond).await;
         let usage = MockServer::start(|_, _| json_response(StatusCode::OK, json!({ "usage": true }))).await;
         let token_endpoint = MockServer::token_endpoint("rt-2").await;
@@ -37,6 +46,7 @@ impl Bridge {
             usage_url: usage.url("/backend-api/wham/usage"),
             user_agent: USER_AGENT.into(),
             tokens,
+            api_keys,
         });
         Self {
             addr: spawn(router(app)).await,
@@ -305,6 +315,7 @@ async fn unreachable_upstream_yields_502() {
         usage_url: "http://127.0.0.1:1/usage".into(),
         user_agent: USER_AGENT.into(),
         tokens: auth::TokenStore::with_token_url(file.path.clone(), "http://127.0.0.1:1".into(), client),
+        api_keys: Vec::new(),
     });
     let addr = spawn(router(app)).await;
     let res = reqwest::get(format!("http://{addr}/models")).await.unwrap();
@@ -383,4 +394,153 @@ async fn refresh_only_accepts_post() {
     let res = bridge.http.get(bridge.url("/refresh")).send().await.unwrap();
     assert_eq!(res.status(), 405);
     assert_eq!(bridge.token_endpoint.count(), 0);
+}
+
+// --- client-side authentication ----------------------------------------
+
+const KEY: &str = "sk-bridge-primary";
+
+fn keys() -> Vec<String> {
+    vec![KEY.into(), "sk-bridge-rotating".into()]
+}
+
+#[test]
+fn api_keys_are_split_on_commas_and_trimmed() {
+    std::env::set_var("BRIDGE_API_KEY", " sk-one , sk-two ,, ");
+    assert_eq!(api_keys_from_env(), vec!["sk-one".to_string(), "sk-two".into()]);
+    std::env::set_var("BRIDGE_API_KEY", "");
+    assert!(api_keys_from_env().is_empty());
+    std::env::remove_var("BRIDGE_API_KEY");
+    assert!(api_keys_from_env().is_empty());
+}
+
+#[test]
+fn secret_eq_matches_only_identical_strings() {
+    assert!(secret_eq("sk-abc", "sk-abc"));
+    assert!(secret_eq("", ""));
+    assert!(!secret_eq("sk-abc", "sk-abd"));
+    assert!(!secret_eq("sk-abc", "sk-abc-with-a-suffix"));
+    assert!(!secret_eq("sk-abc", ""));
+}
+
+#[test]
+fn presented_key_accepts_bearer_or_x_api_key() {
+    let mut headers = HeaderMap::new();
+    assert_eq!(presented_key(&headers), None);
+    headers.insert("x-api-key", "from-x".parse().unwrap());
+    assert_eq!(presented_key(&headers), Some("from-x"));
+    // A bearer token wins, and the scheme is matched case-insensitively.
+    headers.insert(header::AUTHORIZATION, "bearer  from-auth ".parse().unwrap());
+    assert_eq!(presented_key(&headers), Some("from-auth"));
+    // Any other scheme is not a bearer token; fall back to x-api-key.
+    headers.insert(header::AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());
+    assert_eq!(presented_key(&headers), Some("from-x"));
+}
+
+#[tokio::test]
+async fn proxying_without_a_key_is_401_and_never_reaches_upstream() {
+    let bridge = Bridge::guarded(TempFile::json(&fresh_auth()), keys(), ok_text("ok")).await;
+    for res in [
+        bridge
+            .http
+            .post(bridge.url("/responses"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap(),
+        bridge
+            .http
+            .post(bridge.url("/responses"))
+            .header("authorization", "Bearer sk-wrong")
+            .body("{}")
+            .send()
+            .await
+            .unwrap(),
+        bridge.http.get(bridge.url("/usage")).send().await.unwrap(),
+        bridge.http.post(bridge.url("/refresh")).send().await.unwrap(),
+    ] {
+        assert_eq!(res.status(), 401);
+        assert_eq!(res.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        assert_eq!(json_body(res).await["error"]["type"], "bridge_error");
+    }
+    assert_eq!(bridge.upstream.count(), 0);
+    assert_eq!(bridge.usage.count(), 0);
+    assert_eq!(bridge.token_endpoint.count(), 0);
+}
+
+#[tokio::test]
+async fn a_valid_key_passes_through_but_is_not_forwarded_upstream() {
+    let bridge = Bridge::guarded(TempFile::json(&fresh_auth()), keys(), ok_text("ok")).await;
+
+    for (i, request) in [
+        bridge
+            .http
+            .post(bridge.url("/responses"))
+            .header("authorization", format!("Bearer {KEY}")),
+        // Either rotation-era key works, through either header.
+        bridge
+            .http
+            .post(bridge.url("/responses"))
+            .header("x-api-key", "sk-bridge-rotating"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let res = request.body("{}").send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let sent = &bridge.upstream.requests()[i];
+        assert_eq!(
+            sent.header("authorization"),
+            Some(format!("Bearer {}", bridge.current_access_token()).as_str())
+        );
+        assert!(sent.header("x-api-key").is_none());
+    }
+    assert_eq!(bridge.upstream.count(), 2);
+}
+
+#[tokio::test]
+async fn health_stays_open_but_hides_the_account_until_authenticated() {
+    let bridge = Bridge::guarded(TempFile::json(&fresh_auth()), keys(), ok_text("ok")).await;
+
+    let res = bridge.http.get(bridge.url("/health")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body = json_body(res).await;
+    assert_eq!(body, json!({ "ok": true }));
+
+    let res = bridge
+        .http
+        .get(bridge.url("/health"))
+        .header("authorization", format!("Bearer {KEY}"))
+        .send()
+        .await
+        .unwrap();
+    let body = json_body(res).await;
+    assert_eq!(body["email"], EMAIL);
+    assert_eq!(body["token"]["has_refresh_token"], true);
+}
+
+#[tokio::test]
+async fn health_without_credentials_is_503_for_anonymous_callers_too() {
+    let bridge = Bridge::guarded(TempFile::missing(), keys(), ok_text("ok")).await;
+    let res = bridge.http.get(bridge.url("/health")).send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    let body = json_body(res).await;
+    assert_eq!(body["error"]["type"], "bridge_error");
+    // The credentials path is an implementation detail, not for strangers.
+    assert_eq!(body["error"]["message"], "credentials unavailable");
+}
+
+#[tokio::test]
+async fn refresh_works_with_a_key() {
+    let bridge = Bridge::guarded(TempFile::json(&fresh_auth()), keys(), ok_text("ok")).await;
+    let res = bridge
+        .http
+        .post(bridge.url("/refresh"))
+        .header("authorization", format!("Bearer {KEY}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(json_body(res).await["ok"], true);
+    assert_eq!(bridge.token_endpoint.count(), 1);
 }
