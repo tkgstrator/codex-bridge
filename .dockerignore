@@ -1,0 +1,7 @@
+target
+.git
+.github
+.devcontainer
+.vscode
+.env
+auth.json

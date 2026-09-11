@@ -1,0 +1,94 @@
+{
+  // Editor
+  "editor.formatOnSave": true,
+  "editor.formatOnPaste": false,
+  "editor.tabSize": 2,
+  "editor.rulers": [100, 120],
+  "editor.renderWhitespace": "boundary",
+  "editor.guides.bracketPairs": "active",
+  "editor.stickyScroll.enabled": true,
+  "editor.inlineSuggest.enabled": true,
+
+  // Files
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "files.trimFinalNewlines": true,
+  "files.autoSave": "onFocusChange",
+
+  // Explorer noise reduction
+  "files.exclude": {
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true,
+    "**/.git": true,
+    "**/target": true,
+    "**/.cache": true
+  },
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/target/**": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/Cargo.lock": true
+  },
+
+  // File nesting: keep the explorer tidy
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.expand": false,
+  "explorer.fileNesting.patterns": {
+    "Cargo.toml": "Cargo.lock, rust-toolchain*, rustfmt.toml, .cargo/config.toml",
+    "Dockerfile": "compose.yaml, compose.*.yaml, docker-compose.yml, docker-compose.*.yml, .dockerignore",
+    ".gitignore": ".gitattributes",
+    ".env.example": ".env, .env.*",
+    "README.md": "CHANGELOG.md, LICENSE*, CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md, AUTHORS*"
+  },
+
+  // Diff
+  "diffEditor.ignoreTrimWhitespace": false,
+  "diffEditor.renderSideBySide": true,
+
+  // Git
+  "git.autofetch": true,
+  "git.confirmSync": false,
+  "git.pruneOnFetch": true,
+  "git.branchProtection": ["main", "master", "develop"],
+
+  // Terminal
+  "terminal.integrated.scrollback": 10000,
+  "terminal.integrated.defaultProfile.linux": "zsh",
+
+  // Formatters
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
+  "[yaml]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml"
+  },
+  "[markdown]": {
+    "editor.formatOnSave": false,
+    "files.trimTrailingWhitespace": false
+  },
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml"
+  },
+
+  // rust-analyzer
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.allTargets": true,
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "rust-analyzer.procMacro.enable": true,
+  "rust-analyzer.imports.granularity.group": "crate",
+  "rust-analyzer.imports.prefix": "crate",
+  "rust-analyzer.inlayHints.parameterHints.enable": true,
+  "rust-analyzer.inlayHints.typeHints.enable": true,
+  "rust-analyzer.inlayHints.chainingHints.enable": true,
+  "rust-analyzer.completion.autoimport.enable": true
+}

@@ -1,0 +1,20 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - target:/home/vscode/app/target
+      - cargo-registry:/home/vscode/.cargo/registry
+      - cargo-git:/home/vscode/.cargo/git
+      - ../:/home/vscode/app:cached
+    environment:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    tty: true
+    stdin_open: true
+
+volumes:
+  target:
+  cargo-registry:
+  cargo-git:

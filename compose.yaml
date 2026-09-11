@@ -1,0 +1,13 @@
+# Run the production image locally:  docker compose up --build
+services:
+  codex-bridge:
+    build: .
+    image: codex-bridge
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      # Rewritten on token refresh — must stay writable (uid 65532 inside).
+      - ${CODEX_AUTH_PATH:-~/.codex/auth.json}:/data/auth.json
+    environment:
+      CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.154.0}
+    restart: unless-stopped
