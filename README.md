@@ -42,7 +42,7 @@ curl -N http://localhost:3000/responses \
   -H 'content-type: application/json' \
   -H "authorization: Bearer $BRIDGE_API_KEY" \
   -d '{
-    "model": "gpt-5.3-codex-spark",
+    "model": "gpt-5.6-luna",
     "instructions": "You are a helpful assistant.",
     "input": [{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
     "store": false,
@@ -54,7 +54,7 @@ curl -N http://localhost:3000/responses \
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:3000", api_key="sk-bridge-...")  # BRIDGE_API_KEY
 with client.responses.stream(
-    model="gpt-5.3-codex-spark",
+    model="gpt-5.6-luna",
     instructions="You are a helpful assistant.",
     input="hello",
     store=False,
@@ -103,9 +103,9 @@ curl -s localhost:3000/usage | jq .rate_limit.primary_window
 
 パススルーなので、以下を満たさないリクエストは上流のエラーがそのまま返ります。
 
-- `stream: true` / `store: false` / `instructions` (空でない文字列) が必須
+- `stream: true` / `store: false` が必須。省略も不可で、明示的に指定しないと `Stream must be set to true` / `Store must be set to false` が返ります
 - `max_output_tokens` など公開 API にはあるが未対応のパラメータは 400
-- モデルは Codex CLI で使えるもののみ (`gpt-5.5`, `gpt-5.3-codex-spark` など)
+- モデルは ChatGPT アカウントで使えるもののみ (`gpt-5.6-luna`, `gpt-5.5` など)。正確な一覧は `GET /models?client_version=0.154.0` で取れます
 - レスポンスは SSE ですが `Content-Type: text/event-stream` が付かないことがあります
 
 ## Docker
