@@ -5,7 +5,8 @@
 //! the backend uses to classify traffic as the Codex CLI. Whatever the
 //! upstream answers — success, SSE stream, or error — is returned as-is.
 //! The only added behaviour is OAuth token refresh: proactively before
-//! expiry, and once more on an upstream 401.
+//! expiry, and once more on an upstream 401, plus an optional API key
+//! on the client side (BRIDGE_API_KEY).
 
 mod auth;
 #[cfg(test)]
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -31,14 +33,20 @@ struct App {
     usage_url: String,
     user_agent: String,
     tokens: TokenStore,
+    /// Keys a caller may present. Empty = the bridge is unauthenticated.
+    api_keys: Vec<String>,
 }
 
 // Hop-by-hop and connection-specific headers that must not be relayed
 // in either direction. `accept-encoding` is dropped so the upstream
 // answers uncompressed and the body can be streamed through untouched.
+// `authorization` and `x-api-key` are the bridge's own credentials: they
+// are consumed here and never reach the upstream, which authenticates
+// with the subscription token instead.
 const STRIP_REQUEST_HEADERS: &[&str] = &[
     "host",
     "authorization",
+    "x-api-key",
     "connection",
     "content-length",
     "transfer-encoding",
@@ -64,6 +72,73 @@ fn json_error(status: StatusCode, message: &str) -> Response {
         status,
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
+    )
+        .into_response()
+}
+
+// --- client-side authentication ----------------------------------------
+//
+// Opt-in: with BRIDGE_API_KEY unset the bridge answers anyone who can
+// reach it, so it must stay behind a firewall. Since every OpenAI SDK
+// requires an `api_key` and sends it as `Authorization: Bearer <key>`,
+// turning this on costs the caller nothing — they just stop writing
+// "unused" there. Comma-separated values let a key be rotated without
+// downtime: publish the new one, drop the old one once clients moved.
+fn api_keys_from_env() -> Vec<String> {
+    env_or("BRIDGE_API_KEY", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+// Compare without an early exit, so a wrong key cannot be guessed byte
+// by byte from the response time. The lengths are not hidden, but the
+// presented one is the attacker's own input anyway.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
+// `Authorization: Bearer <key>` is what the OpenAI SDKs send; `x-api-key`
+// is accepted too because Anthropic-shaped clients and a few gateways
+// only know that one.
+fn presented_key(headers: &HeaderMap) -> Option<&str> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_once(' '))
+        .and_then(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer").then_some(token.trim()));
+    bearer.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+}
+
+fn authorized(app: &App, headers: &HeaderMap) -> bool {
+    if app.api_keys.is_empty() {
+        return true;
+    }
+    let Some(presented) = presented_key(headers) else {
+        return false;
+    };
+    app.api_keys.iter().any(|key| secret_eq(key, presented))
+}
+
+// `/health` is left open so a load balancer — which cannot attach a key
+// to its health check — can still probe it; the handler withholds the
+// account details from unauthenticated callers.
+async fn guard(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    if req.uri().path() == "/health" || authorized(&app, req.headers()) {
+        return next.run(req).await;
+    }
+    println!("[proxy] {} {} -> 401 (bridge)", req.method(), req.uri().path());
+    (
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        json_error(StatusCode::UNAUTHORIZED, "missing or invalid API key"),
     )
         .into_response()
 }
@@ -179,9 +254,15 @@ fn unix_secs(t: std::time::SystemTime) -> u64 {
 
 // Liveness plus a non-secret view of the stored grant, so a monitor can
 // tell "process up" from "refresh_token is dead" without spending a
-// request against the subscription.
-async fn health(State(app): State<Arc<App>>) -> Response {
+// request against the subscription. An unauthenticated caller still
+// gets the liveness verdict (and the 503 when the grant is broken), but
+// not the identity behind it.
+async fn health_status(app: &App, detailed: bool) -> Response {
     match app.tokens.status().await {
+        Ok(_) if !detailed => {
+            ([(header::CONTENT_TYPE, "application/json")], r#"{"ok":true}"#).into_response()
+        }
+        Err(_) if !detailed => json_error(StatusCode::SERVICE_UNAVAILABLE, "credentials unavailable"),
         Ok(s) => {
             let now = std::time::SystemTime::now();
             let expires_at = s.expires_at.map(unix_secs);
@@ -206,9 +287,15 @@ async fn health(State(app): State<Arc<App>>) -> Response {
     }
 }
 
+async fn health(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let detailed = authorized(&app, &headers);
+    health_status(&app, detailed).await
+}
+
+// Reachable only through the guard, so the answer is always detailed.
 async fn refresh(State(app): State<Arc<App>>) -> Response {
     match app.tokens.refresh_now().await {
-        Ok(_) => health(State(app)).await,
+        Ok(_) => health_status(&app, true).await,
         Err(err) => json_error(StatusCode::BAD_GATEWAY, &err.to_string()),
     }
 }
@@ -229,6 +316,9 @@ fn router(app: Arc<App>) -> Router {
         .route("/health", get(health))
         .route("/refresh", post(refresh))
         .fallback(handle)
+        // `layer` (not `route_layer`) so the fallback — i.e. everything
+        // that gets proxied — is guarded too.
+        .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
 }
 
@@ -253,10 +343,17 @@ async fn main() -> Result<(), Error> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let tokens = TokenStore::new(auth::default_auth_path(), client.clone());
+    let api_keys = api_keys_from_env();
 
     println!("codex-bridge listening on http://localhost:{port}");
     println!("  upstream:    {upstream}");
     println!("  credentials: {}", tokens.path().display());
+    match api_keys.len() {
+        0 => {
+            println!("  auth:        DISABLED — set BRIDGE_API_KEY, or restrict access at the network level")
+        }
+        n => println!("  auth:        BRIDGE_API_KEY ({n} key(s))"),
+    }
 
     let app = Arc::new(App {
         client,
@@ -264,6 +361,7 @@ async fn main() -> Result<(), Error> {
         usage_url,
         user_agent,
         tokens,
+        api_keys,
     });
     let router = router(app);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;

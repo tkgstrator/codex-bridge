@@ -10,4 +10,7 @@ services:
       - ${CODEX_AUTH_PATH:-~/.codex/auth.json}:/data/auth.json
     environment:
       CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.154.0}
+      # Unset = no authentication; anyone who can reach the port can
+      # spend the subscription.
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:-}
     restart: unless-stopped
