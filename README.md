@@ -33,7 +33,7 @@ cargo run --release      # http://localhost:3000
 
 ## 使い方
 
-上流は OpenAI Responses API 互換なので、`base_url` をこのプロキシに向けるだけです。
+上流は OpenAI Responses API 互換なので、`base_url` をこのプロキシ (`http://localhost:3000`、`/v1` なし) に向けるだけです。SDK が `/responses` を足すので、そのまま上流の `backend-api/codex/responses` に届きます。ホストだけ受け取って `/v1/responses` を自前で組み立てるツール向けに、先頭の `/v1` は転送前に取り除くので `http://localhost:3000/v1` でも動きます。
 
 ```sh
 curl -N http://localhost:3000/responses \
@@ -62,7 +62,7 @@ with client.responses.stream(
 
 ### ブリッジ側で持っているエンドポイント
 
-上流のパスと衝突しない範囲で、以下だけ特別扱いしています。それ以外はすべてパススルーです。
+上流のパスと衝突しない範囲で、以下だけ特別扱いしています。それ以外はすべてパススルーです (`/v1/...` は `/v1` を外して転送)。
 
 | エンドポイント | 説明 |
 | --- | --- |

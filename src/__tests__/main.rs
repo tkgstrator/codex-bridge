@@ -93,6 +93,16 @@ async fn json_error_has_the_bridge_error_shape() {
     );
 }
 
+#[test]
+fn strip_v1_only_removes_a_leading_path_segment() {
+    assert_eq!(strip_v1("/v1/responses"), "/responses");
+    assert_eq!(strip_v1("/v1/responses?stream=true"), "/responses?stream=true");
+    assert_eq!(strip_v1("/responses"), "/responses");
+    assert_eq!(strip_v1("/v1beta/responses"), "/v1beta/responses");
+    assert_eq!(strip_v1("/v1"), "/v1");
+    assert_eq!(strip_v1("/"), "/");
+}
+
 // --- proxying -----------------------------------------------------------
 
 #[tokio::test]
@@ -141,6 +151,28 @@ async fn forwards_request_verbatim_and_impersonates_the_cli() {
     assert!(uuid::Uuid::parse_str(sent.header("session_id").unwrap()).is_ok());
     assert!(sent.header("accept-encoding").is_none());
     assert_eq!(bridge.token_endpoint.count(), 0);
+}
+
+#[tokio::test]
+async fn accepts_the_v1_prefix_openai_sdks_send() {
+    let bridge = Bridge::start(TempFile::json(&fresh_auth()), ok_text("ok")).await;
+    let res = bridge
+        .http
+        .post(bridge.url("/v1/responses?stream=true"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        bridge.upstream.requests()[0].uri,
+        "/backend-api/codex/responses?stream=true"
+    );
+
+    let res = bridge.http.get(bridge.url("/v1/usage")).send().await.unwrap();
+    assert_eq!(json_body(res).await, json!({ "usage": true }));
+    assert_eq!(bridge.usage.count(), 1);
+    assert_eq!(bridge.upstream.count(), 1);
 }
 
 #[tokio::test]

@@ -117,12 +117,22 @@ async fn send(
     Ok((res, creds.access_token))
 }
 
+// OpenAI SDKs default to a base_url ending in `/v1` and LiteLLM & co.
+// hard-code `<base>/v1/responses`; the Codex backend has no such prefix.
+fn strip_v1(path_and_query: &str) -> &str {
+    match path_and_query.strip_prefix("/v1") {
+        Some(rest) if rest.starts_with('/') => rest,
+        _ => path_and_query,
+    }
+}
+
 async fn proxy(app: Arc<App>, req: Request) -> Result<Response, Error> {
     let (parts, body) = req.into_parts();
-    let path_and_query = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+    let path_and_query = strip_v1(parts.uri.path_and_query().map_or("/", |p| p.as_str()));
+    let path = path_and_query.split('?').next().unwrap_or_default();
     // `/usage` is the one path that lives outside the codex root
     // (backend-api/wham/usage); everything else maps 1:1 onto CODEX_UPSTREAM.
-    let target = if parts.method == axum::http::Method::GET && parts.uri.path() == "/usage" {
+    let target = if parts.method == axum::http::Method::GET && path == "/usage" {
         app.usage_url.clone()
     } else {
         format!("{}{}", app.upstream, path_and_query)
