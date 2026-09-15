@@ -140,8 +140,6 @@ cargo fmt              # フォーマット (rustfmt.toml: max_width = 110)
 
 EC2 `t4g.nano` (arm64) に Docker を入れて `compose.yaml` で動かすのが最も安価 (月 $5 前後) で、この設計に一番合っています。TLS 終端は Cloudflare Tunnel か Caddy を前段に置いてください。
 
-ECS (EC2 起動タイプ) に載せる場合の制約・タスク定義・`auth.json` の投入手順は [docs/deploy-ecs-ec2.md](docs/deploy-ecs-ec2.md) にまとめています (Terraform を書く LLM 向け)。
-
 ## 注意
 
 - `refresh_token` は使い捨てでローテーションします。同じ `auth.json` を複数プロセスで共有すると、片方が持つ `refresh_token` が無効化されることがあります
