@@ -1,8 +1,15 @@
-//! codex-mcp — an MCP (stdio) server that lets an MCP client (e.g. Claude
-//! Code) call the ChatGPT Codex backend directly, using the same
+//! codex-mcp — an MCP server that lets an MCP client (e.g. Claude Code)
+//! call the ChatGPT Codex backend directly, using the same
 //! `~/.codex/auth.json` OAuth grant as codex-bridge and the official
 //! Codex CLI. Unlike codex-bridge it talks to CODEX_UPSTREAM itself; no
 //! separate HTTP proxy process needs to be running.
+//!
+//! Two transports, selected at startup: stdio by default (a client spawns
+//! this as a local subprocess, e.g. `claude mcp add -- codex-mcp`), or
+//! Streamable HTTP when `MCP_HTTP_PORT` is set (for a remote client like
+//! Claude Code Desktop). HTTP mode should be paired with `MCP_API_KEY` —
+//! same Bearer/`x-api-key` gate as codex-bridge's `BRIDGE_API_KEY` — since
+//! anyone who reaches the port can otherwise spend the account behind it.
 //!
 //! Three tools are exposed:
 //! - `ask_codex`: send a prompt to the Responses API and return the
@@ -13,12 +20,26 @@
 //!   and return the resulting image.
 //! - `list_models`: passthrough of `GET /models`, unmodified.
 
+// Shared with the lib crate's and codex-bridge's own test modules.
+#[cfg(test)]
+#[path = "../__tests__/support.rs"]
+#[allow(dead_code)]
+mod support;
+
 use std::sync::Arc;
 
+use axum::extract::{Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
 use codex_bridge::auth::{self, TokenStore};
-use codex_bridge::{env_or, Error};
+use codex_bridge::{api_keys_from_env, env_or, presented_key, secret_eq, Error};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_router, ErrorData as McpError, ServiceExt};
 use serde_json::{json, Map, Value};
 
@@ -426,19 +447,208 @@ impl CodexMcp {
     }
 }
 
+// `Authorization: Bearer <key>` / `x-api-key` gate for the HTTP transport,
+// same shape as codex-bridge's `guard` — but there is no open-paths list
+// here: `/health` is mounted outside this layer entirely (see `serve_http`).
+async fn mcp_guard(State(keys): State<Vec<String>>, req: Request, next: Next) -> Response {
+    let ok = keys.is_empty()
+        || presented_key(req.headers())
+            .is_some_and(|presented| keys.iter().any(|key| secret_eq(key, presented)));
+    if ok {
+        return next.run(req).await;
+    }
+    println!("[mcp] {} {} -> 401", req.method(), req.uri().path());
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        "missing or invalid API key",
+    )
+        .into_response()
+}
+
+// A comma-separated list of hostnames (or `host:port`) this server will
+// answer Streamable HTTP requests addressed to — see `allowed_hosts` on
+// `StreamableHttpServerConfig`. Defaults to loopback-only (DNS-rebinding
+// protection), so a remote deployment must opt in explicitly.
+fn allowed_hosts_from_env() -> Vec<String> {
+    env_or("MCP_ALLOWED_HOSTS", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+// `/mcp` (guarded by `keys`, empty = unauthenticated) plus an open
+// `/health` for container/load-balancer probes. Split out from
+// `serve_http` so tests can exercise the auth gate without binding a
+// real listener.
+fn mcp_router(ctx: Arc<UpstreamCtx>, keys: Vec<String>, config: StreamableHttpServerConfig) -> Router {
+    let service = StreamableHttpService::new(
+        move || Ok(CodexMcp { ctx: ctx.clone() }),
+        Arc::new(LocalSessionManager::default()),
+        config,
+    );
+    let guarded = Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn_with_state(keys, mcp_guard));
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .merge(guarded)
+}
+
+async fn serve_http(ctx: Arc<UpstreamCtx>, port: u16) -> Result<(), Error> {
+    let keys = api_keys_from_env("MCP_API_KEY");
+    let allowed_hosts = allowed_hosts_from_env();
+
+    println!("codex-mcp (http) listening on http://0.0.0.0:{port}/mcp");
+    println!("  upstream:    {}", ctx.upstream);
+    println!("  credentials: {}", ctx.tokens.path().display());
+    match keys.len() {
+        0 => println!("  auth:        DISABLED — set MCP_API_KEY, or restrict access at the network level"),
+        n => println!("  auth:        MCP_API_KEY ({n} key(s))"),
+    }
+    if allowed_hosts.is_empty() {
+        println!("  hosts:       localhost/127.0.0.1/::1 only — set MCP_ALLOWED_HOSTS to accept others");
+    } else {
+        println!("  hosts:       {}", allowed_hosts.join(", "));
+    }
+
+    let mut config = StreamableHttpServerConfig::default();
+    if !allowed_hosts.is_empty() {
+        config = config.with_allowed_hosts(allowed_hosts);
+    }
+    let router = mcp_router(ctx, keys, config);
+
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let server = CodexMcp {
-        ctx: Arc::new(UpstreamCtx::from_env()),
-    };
-    let service = server.serve(rmcp::transport::stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+    let ctx = Arc::new(UpstreamCtx::from_env());
+    match std::env::var("MCP_HTTP_PORT").ok() {
+        Some(port) => serve_http(ctx, port.parse()?).await,
+        None => {
+            let server = CodexMcp { ctx };
+            let service = server.serve(rmcp::transport::stdio()).await?;
+            service.waiting().await?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_ctx() -> Arc<UpstreamCtx> {
+        Arc::new(UpstreamCtx {
+            client: reqwest::Client::new(),
+            upstream: "http://127.0.0.1:1".into(),
+            user_agent: "codex-mcp-test".into(),
+            tokens: TokenStore::with_token_url(
+                std::env::temp_dir().join("codex-mcp-test-unused-auth.json"),
+                "http://127.0.0.1:1".into(),
+                reqwest::Client::new(),
+            ),
+            default_model: "test-model".into(),
+            cli_version: "0".into(),
+        })
+    }
+
+    fn initialize_body() -> &'static str {
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#
+    }
+
+    #[tokio::test]
+    async fn health_is_reachable_without_a_key() {
+        let addr = support::spawn(mcp_router(
+            test_ctx(),
+            vec!["secret".into()],
+            StreamableHttpServerConfig::default(),
+        ))
+        .await;
+        let res = reqwest::get(format!("http://{addr}/health")).await.unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn mcp_without_a_key_is_401_when_keys_are_configured() {
+        let addr = support::spawn(mcp_router(
+            test_ctx(),
+            vec!["secret".into()],
+            StreamableHttpServerConfig::default(),
+        ))
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn mcp_with_the_wrong_key_is_401() {
+        let addr = support::spawn(mcp_router(
+            test_ctx(),
+            vec!["secret".into()],
+            StreamableHttpServerConfig::default(),
+        ))
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .bearer_auth("wrong")
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn mcp_with_the_right_key_passes_the_guard() {
+        let addr = support::spawn(mcp_router(
+            test_ctx(),
+            vec!["secret".into()],
+            StreamableHttpServerConfig::default(),
+        ))
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .bearer_auth("secret")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(initialize_body())
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(res.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn mcp_is_open_when_no_keys_are_configured() {
+        let addr = support::spawn(mcp_router(
+            test_ctx(),
+            Vec::new(),
+            StreamableHttpServerConfig::default(),
+        ))
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(initialize_body())
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(res.status(), 401);
+    }
 
     // The upstream backend has been observed to leave `response.completed`'s
     // own `response.output` array empty, so the fixtures below carry the

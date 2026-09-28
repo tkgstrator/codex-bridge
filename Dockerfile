@@ -30,8 +30,12 @@ RUN find src -exec touch {} + \
 # else. The binary is static (musl + rustls) so no libc is needed.
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /app/target/release/codex-bridge /codex-bridge
+COPY --from=build /app/target/release/codex-mcp /codex-mcp
 ENV PORT=3000
 ENV CODEX_AUTH_PATH=/data/auth.json
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s CMD ["/codex-bridge", "--health"]
+# Default entrypoint is the codex-bridge HTTP proxy. To run codex-mcp's
+# Streamable HTTP transport instead (e.g. for Claude Code Desktop), override
+# it: `docker run --entrypoint /codex-mcp -e MCP_HTTP_PORT=... -e MCP_API_KEY=... ...`
 ENTRYPOINT ["/codex-bridge"]
