@@ -135,9 +135,7 @@ fn trim_model_catalog(body: &str) -> Result<String, String> {
         }
         let kept: Map<String, Value> = fields
             .into_iter()
-            .filter(|(_, v)| {
-                serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) <= MAX_MODEL_FIELD_BYTES
-            })
+            .filter(|(_, v)| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) <= MAX_MODEL_FIELD_BYTES)
             .collect();
         trimmed.push(Value::Object(kept));
     }
@@ -236,7 +234,11 @@ fn extract_output_text(sse_body: &str) -> Result<String, String> {
     if !terminated {
         return Err("upstream stream ended without a response.completed event".into());
     }
-    let text = if !item_text.is_empty() { item_text } else { delta_text };
+    let text = if !item_text.is_empty() {
+        item_text
+    } else {
+        delta_text
+    };
     if text.is_empty() {
         return Err(format!(
             "response incomplete: {}",

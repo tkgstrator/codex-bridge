@@ -354,7 +354,9 @@ impl TokenStore {
         if !res.status().is_success() {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
-            return Err(format!("device-code request failed: {status} {body}").trim().into());
+            return Err(format!("device-code request failed: {status} {body}")
+                .trim()
+                .into());
         }
         let Value::Object(body) = serde_json::from_slice::<Value>(&res.bytes().await?)? else {
             return Err("device-code request returned an unexpected payload".into());
@@ -421,7 +423,11 @@ impl TokenStore {
     /// to the credentials file — creating it if this is a first-ever
     /// sign-in. Unlike `rotate`, an unreadable or missing file is not an
     /// error here: it just means there is nothing to preserve.
-    pub async fn install_from_device_code(&self, code: &str, code_verifier: &str) -> Result<Credentials, Error> {
+    pub async fn install_from_device_code(
+        &self,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<Credentials, Error> {
         let _guard = self.lock.lock().await;
         let res = self
             .client
@@ -438,7 +444,9 @@ impl TokenStore {
         if !res.status().is_success() {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
-            return Err(format!("device-code token exchange failed: {status} {body}").trim().into());
+            return Err(format!("device-code token exchange failed: {status} {body}")
+                .trim()
+                .into());
         }
         let exchanged = match serde_json::from_slice::<Value>(&res.bytes().await?) {
             Ok(Value::Object(m)) if str_field(&m, "access_token").is_some() => m,

@@ -375,7 +375,11 @@ async fn device_poll(State(app): State<Arc<App>>, body: Bytes) -> Response {
     // from memory, or both could reach upstream and the single-use code
     // would be exchanged twice.
     app.device_flows.mark_polled(&req.flow_id).await;
-    match app.tokens.poll_device_code(&flow.device_auth_id, &flow.user_code).await {
+    match app
+        .tokens
+        .poll_device_code(&flow.device_auth_id, &flow.user_code)
+        .await
+    {
         Ok(DevicePoll::Pending) => json_ok(serde_json::json!({ "status": "pending" })),
         Ok(DevicePoll::Authorized { code, code_verifier }) => {
             app.device_flows.set_phase(&req.flow_id, Phase::Completing).await;
