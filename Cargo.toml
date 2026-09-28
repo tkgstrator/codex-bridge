@@ -5,10 +5,18 @@ edition = "2021"
 description = "Minimal passthrough proxy to the ChatGPT Codex backend with automatic OAuth token refresh"
 license = "MIT"
 
+[lib]
+name = "codex_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codex-bridge"
+path = "src/main.rs"
+
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "sync"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }

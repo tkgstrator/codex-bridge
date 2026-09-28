@@ -1,3 +1,4 @@
 /target
 .env
 auth.json
+.DS_Store

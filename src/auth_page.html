@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Sign In</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #f7f7f5; --card: #fff; --ink: #171717; --muted: #686868; --line: #deded8; --accent: #0f7b6c; --danger: #b42318; --success: #087443; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #161616; --card: #222; --ink: #f4f4f1; --muted: #a8a8a0; --line: #3c3c39; --accent: #50c9b5; --danger: #ff8b7d; --success: #68d391; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; padding: 24px 16px; background: var(--bg); color: var(--ink); font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(100%, 560px); margin: 7vh auto; }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.03em; }
+    .lede { margin: 0 0 26px; color: var(--muted); }
+    .card { padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); box-shadow: 0 8px 26px rgb(0 0 0 / 5%); }
+    label { display: block; margin-bottom: 7px; font-size: 14px; font-weight: 600; }
+    input { display: block; width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: transparent; font: inherit; }
+    .hint { margin: 7px 0 20px; color: var(--muted); font-size: 13px; }
+    button { width: 100%; padding: 11px 14px; border: 0; border-radius: 8px; color: white; background: var(--accent); cursor: pointer; font: inherit; font-weight: 650; }
+    button:disabled { cursor: wait; opacity: .65; }
+    .flow { display: none; text-align: center; }
+    .flow.visible { display: block; }
+    .code { margin: 15px 0 18px; font: 700 32px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; letter-spacing: .08em; }
+    .flow p { margin: 10px 0; }
+    a { color: var(--accent); font-weight: 650; }
+    .timer, #status { color: var(--muted); font-size: 14px; }
+    #status.error { color: var(--danger); }
+    #status.success { color: var(--success); }
+    .restart { margin-top: 18px; background: transparent; border: 1px solid var(--line); color: var(--ink); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Connect ChatGPT</h1>
+    <p class="lede">Sign in to the ChatGPT account codex-bridge should use.</p>
+    <section class="card" id="start-card">
+      <label for="api-key">Bridge API key <span style="font-weight:400; color:var(--muted)">(if configured)</span></label>
+      <input id="api-key" type="password" autocomplete="off" placeholder="Leave blank when BRIDGE_API_KEY is unset">
+      <p class="hint">Stored only in this browser, to authorize this sign-in request.</p>
+      <button id="start">Sign in with ChatGPT</button>
+      <p id="start-error" class="hint" style="display:none; color:var(--danger)"></p>
+    </section>
+    <section class="card flow" id="flow-card">
+      <p>Open the link below in a browser, sign in to ChatGPT, then enter this one-time code.</p>
+      <a id="verification-link" href="#" target="_blank" rel="noopener">Open ChatGPT device sign-in</a>
+      <div class="code" id="code"></div>
+      <p class="timer" id="timer"></p>
+      <p id="status">Waiting for approval…</p>
+      <button class="restart" id="restart">Start over</button>
+    </section>
+  </main>
+  <script>
+    const keyInput = document.querySelector('#api-key');
+    const startCard = document.querySelector('#start-card');
+    const flowCard = document.querySelector('#flow-card');
+    const startButton = document.querySelector('#start');
+    const startError = document.querySelector('#start-error');
+    const status = document.querySelector('#status');
+    const timer = document.querySelector('#timer');
+    let timerId, pollId, expiresAt;
+
+    keyInput.value = localStorage.getItem('codex-bridge-api-key') || '';
+    keyInput.addEventListener('change', () => localStorage.setItem('codex-bridge-api-key', keyInput.value));
+
+    function headers() {
+      const key = keyInput.value.trim();
+      return { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) };
+    }
+    function reset() {
+      clearInterval(timerId); clearTimeout(pollId);
+      flowCard.classList.remove('visible'); startCard.style.display = '';
+      startButton.disabled = false;
+    }
+    function setStatus(text, className = '') { status.textContent = text; status.className = className; }
+    function tick() {
+      const seconds = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+      timer.textContent = seconds ? `Code expires in ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : 'Code expired.';
+      if (!seconds) { setStatus('This code expired. Start a new sign-in.', 'error'); clearTimeout(pollId); }
+    }
+    async function poll(flowId, intervalSeconds) {
+      try {
+        const res = await fetch('/auth/device/poll', { method: 'POST', headers: headers(), body: JSON.stringify({ flowId }) });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error?.message || body.error || `Request failed (${res.status})`);
+        if (body.status === 'connected') { clearInterval(timerId); setStatus('Connected. This bridge is ready to use.', 'success'); return; }
+        if (body.status === 'expired') { clearInterval(timerId); setStatus('This code expired. Start a new sign-in.', 'error'); return; }
+        pollId = setTimeout(() => poll(flowId, intervalSeconds), intervalSeconds * 1000);
+      } catch (err) { setStatus(err.message, 'error'); }
+    }
+    startButton.addEventListener('click', async () => {
+      localStorage.setItem('codex-bridge-api-key', keyInput.value);
+      startError.style.display = 'none'; startButton.disabled = true;
+      try {
+        const res = await fetch('/auth/device/start', { method: 'POST', headers: headers(), body: '{}' });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error?.message || body.error || `Request failed (${res.status})`);
+        expiresAt = body.expiresAt * 1000;
+        document.querySelector('#code').textContent = body.userCode;
+        const link = document.querySelector('#verification-link'); link.href = body.verificationUri;
+        startCard.style.display = 'none'; flowCard.classList.add('visible');
+        setStatus('Waiting for approval…'); tick(); timerId = setInterval(tick, 1000);
+        poll(body.flowId, body.intervalSeconds);
+      } catch (err) { startError.textContent = err.message; startError.style.display = ''; startButton.disabled = false; }
+    });
+    document.querySelector('#restart').addEventListener('click', reset);
+  </script>
+</body>
+</html>

@@ -47,6 +47,7 @@ impl Bridge {
             user_agent: USER_AGENT.into(),
             tokens,
             api_keys,
+            device_flows: DeviceFlowStore::new(),
         });
         Self {
             addr: spawn(router(app)).await,
