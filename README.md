@@ -110,12 +110,38 @@ curl -s localhost:3000/usage | jq .rate_limit.primary_window
 
 ## MCP (codex-mcp)
 
-`codex-bridge` とは別のバイナリ `codex-mcp` として、Claude Code などのMCPクライアントから直接Codexバックエンドを呼べる標準入出力 (stdio) MCPサーバーを同梱しています。`codex-bridge` のHTTPプロセスは不要で、`~/.codex/auth.json` を直接読み書きして認証します。
+`codex-bridge` とは別のバイナリ `codex-mcp` として、Claude Code などのMCPクライアントから直接Codexバックエンドを呼べるMCPサーバーを同梱しています。`codex-bridge` のHTTPプロセスは不要で、`~/.codex/auth.json` を直接読み書きして認証します。
+
+transport は起動時に `MCP_HTTP_PORT` の有無で切り替わります:
+
+- **未設定 (既定)**: stdio — MCPクライアントがローカルでサブプロセスとして起動する用途 (`claude mcp add -- codex-mcp` など)
+- **設定時**: Streamable HTTP — Claude Code Desktop など、ネットワーク越しに接続するクライアント向け
+
+### ローカル (stdio)
 
 ```sh
 cargo build --release --bin codex-mcp
 claude mcp add codex -- $(pwd)/target/release/codex-mcp
 ```
+
+### リモート (HTTP)
+
+`MCP_HTTP_PORT` を設定すると、`/mcp` に Streamable HTTP で待ち受けます。誰でも到達できてしまうと ChatGPT/Codex アカウントが無認証で使われるので、**`MCP_API_KEY` の設定が必須**です (`codex-bridge` の `BRIDGE_API_KEY` と同じ Bearer/`x-api-key` 認証)。デフォルトでは DNS rebinding 対策のため `localhost`/`127.0.0.1`/`::1` 宛のリクエストしか受け付けないので、実際のホスト名で公開するなら `MCP_ALLOWED_HOSTS` も設定してください。
+
+```sh
+MCP_HTTP_PORT=8080 MCP_API_KEY=$(openssl rand -hex 32) MCP_ALLOWED_HOSTS=codex.example.com \
+  cargo run --release --bin codex-mcp
+```
+
+Claude Code から接続する例:
+
+```sh
+claude mcp add codex --transport http \
+  --header "Authorization: Bearer <MCP_API_KEY>" \
+  https://codex.example.com/mcp
+```
+
+`/health` は認証なしで到達できます (コンテナのヘルスチェック用)。`/mcp` 以外は認証を通っても存在しません。
 
 環境変数 (すべて任意):
 
@@ -125,6 +151,9 @@ claude mcp add codex -- $(pwd)/target/release/codex-mcp
 | `CODEX_UPSTREAM` | `https://chatgpt.com/backend-api/codex` | 転送先 (codex-bridgeと共通) |
 | `CODEX_CLI_VERSION` | `0.0.0` | `User-Agent: codex_cli/<ver>` に使うバージョン (codex-bridgeと共通) |
 | `CODEX_MCP_DEFAULT_MODEL` | `gpt-5.6-luna` | `ask_codex` の `model` 省略時のデフォルト |
+| `MCP_HTTP_PORT` | (なし) | 設定すると stdio の代わりに Streamable HTTP でこのポートに待ち受ける |
+| `MCP_API_KEY` | (なし) | HTTP transport 時に受け付ける API キー。カンマ区切りで複数可。未設定だと **誰でも叩けます** |
+| `MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | HTTP transport が応答するホスト名 (`Host` ヘッダー)。カンマ区切り |
 
 ### 公開しているツール
 
@@ -151,6 +180,14 @@ docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/codex-bridg
 
 - ビルドステージは `rust:alpine` で各プラットフォームのネイティブ musl 静的ビルド、実行ステージは `gcr.io/distroless/static-debian12:nonroot`
 - `auth.json` はリフレッシュ時に書き換わるため、読み取り専用 (`:ro`) でマウントしないでください。コンテナは `nonroot` (uid 65532) で動くので、ファイルに書き込み権限が必要です
+- イメージには `codex-bridge` と `codex-mcp` の両方が同梱されています。既定の `ENTRYPOINT` は `codex-bridge` (HTTPプロキシ) で、`codex-mcp` を HTTP transport で動かすには `--entrypoint` で上書きします:
+
+```sh
+docker run --entrypoint /codex-mcp \
+  -e MCP_HTTP_PORT=8080 -e MCP_API_KEY=$(openssl rand -hex 32) -e MCP_ALLOWED_HOSTS=codex.example.com \
+  -p 8080:8080 -v ~/.codex/auth.json:/data/auth.json \
+  codex-bridge
+```
 
 ## 開発
 

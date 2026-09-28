@@ -406,39 +406,6 @@ fn keys() -> Vec<String> {
     vec![KEY.into(), "sk-bridge-rotating".into()]
 }
 
-#[test]
-fn api_keys_are_split_on_commas_and_trimmed() {
-    std::env::set_var("BRIDGE_API_KEY", " sk-one , sk-two ,, ");
-    assert_eq!(api_keys_from_env(), vec!["sk-one".to_string(), "sk-two".into()]);
-    std::env::set_var("BRIDGE_API_KEY", "");
-    assert!(api_keys_from_env().is_empty());
-    std::env::remove_var("BRIDGE_API_KEY");
-    assert!(api_keys_from_env().is_empty());
-}
-
-#[test]
-fn secret_eq_matches_only_identical_strings() {
-    assert!(secret_eq("sk-abc", "sk-abc"));
-    assert!(secret_eq("", ""));
-    assert!(!secret_eq("sk-abc", "sk-abd"));
-    assert!(!secret_eq("sk-abc", "sk-abc-with-a-suffix"));
-    assert!(!secret_eq("sk-abc", ""));
-}
-
-#[test]
-fn presented_key_accepts_bearer_or_x_api_key() {
-    let mut headers = HeaderMap::new();
-    assert_eq!(presented_key(&headers), None);
-    headers.insert("x-api-key", "from-x".parse().unwrap());
-    assert_eq!(presented_key(&headers), Some("from-x"));
-    // A bearer token wins, and the scheme is matched case-insensitively.
-    headers.insert(header::AUTHORIZATION, "bearer  from-auth ".parse().unwrap());
-    assert_eq!(presented_key(&headers), Some("from-auth"));
-    // Any other scheme is not a bearer token; fall back to x-api-key.
-    headers.insert(header::AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());
-    assert_eq!(presented_key(&headers), Some("from-x"));
-}
-
 #[tokio::test]
 async fn proxying_without_a_key_is_401_and_never_reaches_upstream() {
     let bridge = Bridge::guarded(TempFile::json(&fresh_auth()), keys(), ok_text("ok")).await;

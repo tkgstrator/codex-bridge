@@ -28,7 +28,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use codex_bridge::auth::{self, DevicePoll, TokenStore};
-use codex_bridge::{env_or, Error};
+use codex_bridge::{api_keys_from_env, env_or, presented_key, secret_eq, Error};
 use device_flow::{DeviceFlowStore, Phase};
 
 // Paths reachable without BRIDGE_API_KEY. `/health` so a load balancer
@@ -97,42 +97,8 @@ fn json_ok(body: serde_json::Value) -> Response {
 // reach it, so it must stay behind a firewall. Since every OpenAI SDK
 // requires an `api_key` and sends it as `Authorization: Bearer <key>`,
 // turning this on costs the caller nothing — they just stop writing
-// "unused" there. Comma-separated values let a key be rotated without
-// downtime: publish the new one, drop the old one once clients moved.
-fn api_keys_from_env() -> Vec<String> {
-    env_or("BRIDGE_API_KEY", "")
-        .split(',')
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-// Compare without an early exit, so a wrong key cannot be guessed byte
-// by byte from the response time. The lengths are not hidden, but the
-// presented one is the attacker's own input anyway.
-fn secret_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
-        diff |= usize::from(x ^ y);
-    }
-    diff == 0
-}
-
-// `Authorization: Bearer <key>` is what the OpenAI SDKs send; `x-api-key`
-// is accepted too because Anthropic-shaped clients and a few gateways
-// only know that one.
-fn presented_key(headers: &HeaderMap) -> Option<&str> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split_once(' '))
-        .and_then(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer").then_some(token.trim()));
-    bearer.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
-}
-
+// "unused" there. `api_keys_from_env`/`secret_eq`/`presented_key` live in
+// the lib crate so codex-mcp's HTTP transport can reuse the same gate.
 fn authorized(app: &App, headers: &HeaderMap) -> bool {
     if app.api_keys.is_empty() {
         return true;
@@ -449,7 +415,7 @@ async fn main() -> Result<(), Error> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let tokens = TokenStore::new(auth::default_auth_path(), client.clone());
-    let api_keys = api_keys_from_env();
+    let api_keys = api_keys_from_env("BRIDGE_API_KEY");
 
     println!("codex-bridge listening on http://localhost:{port}");
     println!("  upstream:    {upstream}");
