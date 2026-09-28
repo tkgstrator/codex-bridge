@@ -25,6 +25,21 @@ const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 
+// `codex login --device-auth`'s API, captured from the openai/codex CLI
+// binary and cross-checked against a working implementation. Not part
+// of the public OAuth surface — `/deviceauth/usercode` (no `/api/accounts`
+// prefix) is a Cloudflare-challenge-protected browser route and is NOT
+// this; these `/api/accounts/...` paths are the plain machine API the
+// CLI itself calls, verified reachable without solving a challenge.
+const DEFAULT_DEVICE_USERCODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const DEFAULT_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+// Shown to the human; never itself called by this client.
+const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+// Only has to match what the token exchange sends back, never be
+// reachable — the same RFC 6749 loopback-redirect rule applies.
+const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 // Refresh this far ahead of `exp` so a long request started right at
 // the threshold doesn't 401 mid-flight.
 const REFRESH_LEEWAY: Duration = Duration::from_secs(5 * 60);
@@ -50,8 +65,27 @@ pub struct TokenStatus {
 pub struct TokenStore {
     path: PathBuf,
     token_url: String,
+    device_usercode_url: String,
+    device_token_url: String,
     client: reqwest::Client,
     lock: Mutex<()>,
+}
+
+/// A freshly issued device-code grant, ready to show to a human.
+#[derive(Debug)]
+pub struct DeviceCode {
+    pub device_auth_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub interval: Duration,
+}
+
+/// Result of one poll of an outstanding device-code flow.
+pub enum DevicePoll {
+    /// Not yet approved by the human.
+    Pending,
+    /// Approved; exchange this for tokens via `install_from_device_code`.
+    Authorized { code: String, code_verifier: String },
 }
 
 pub fn default_auth_path() -> PathBuf {
@@ -130,13 +164,35 @@ fn credentials_of(tokens: &Map<String, Value>) -> Credentials {
 impl TokenStore {
     pub fn new(path: PathBuf, client: reqwest::Client) -> Self {
         let token_url = std::env::var("CODEX_TOKEN_URL").unwrap_or_else(|_| DEFAULT_TOKEN_URL.into());
-        Self::with_token_url(path, token_url, client)
+        let device_usercode_url =
+            std::env::var("CODEX_DEVICE_USERCODE_URL").unwrap_or_else(|_| DEFAULT_DEVICE_USERCODE_URL.into());
+        let device_token_url =
+            std::env::var("CODEX_DEVICE_TOKEN_URL").unwrap_or_else(|_| DEFAULT_DEVICE_TOKEN_URL.into());
+        Self::with_urls(path, token_url, device_usercode_url, device_token_url, client)
     }
 
     pub fn with_token_url(path: PathBuf, token_url: String, client: reqwest::Client) -> Self {
+        Self::with_urls(
+            path,
+            token_url,
+            DEFAULT_DEVICE_USERCODE_URL.into(),
+            DEFAULT_DEVICE_TOKEN_URL.into(),
+            client,
+        )
+    }
+
+    pub fn with_urls(
+        path: PathBuf,
+        token_url: String,
+        device_usercode_url: String,
+        device_token_url: String,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             path,
             token_url,
+            device_usercode_url,
+            device_token_url,
             client,
             lock: Mutex::new(()),
         }
@@ -281,6 +337,150 @@ impl TokenStore {
             return Ok(credentials_of(&tokens));
         }
         self.rotate(auth).await
+    }
+
+    /// Start a `codex login --device-auth`-equivalent sign-in: ask
+    /// auth.openai.com for a one-time code to show a human. Does not
+    /// touch the credentials file — nothing is written until
+    /// `install_from_device_code` succeeds.
+    pub async fn request_device_code(&self) -> Result<DeviceCode, Error> {
+        let res = self
+            .client
+            .post(&self.device_usercode_url)
+            .header("content-type", "application/json")
+            .json(&json!({ "client_id": CODEX_CLIENT_ID }))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            return Err(format!("device-code request failed: {status} {body}")
+                .trim()
+                .into());
+        }
+        let Value::Object(body) = serde_json::from_slice::<Value>(&res.bytes().await?)? else {
+            return Err("device-code request returned an unexpected payload".into());
+        };
+        let device_auth_id = str_field(&body, "device_auth_id")
+            .ok_or("device-code response carried no device_auth_id")?
+            .to_string();
+        // The struct this mirrors accepts either key; only one is ever
+        // actually sent, but which one is not documented.
+        let user_code = str_field(&body, "user_code")
+            .or_else(|| str_field(&body, "usercode"))
+            .ok_or("device-code response carried neither user_code nor usercode")?
+            .to_string();
+        // `interval` arrives as a numeric string in practice, but parse
+        // permissively: fall back to the default rather than fail a
+        // login over a formatting quirk in a field that is a pacing hint.
+        let interval = body
+            .get("interval")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+            .map(Duration::from_secs)
+            .filter(|d| !d.is_zero())
+            .unwrap_or(DEFAULT_DEVICE_POLL_INTERVAL);
+        Ok(DeviceCode {
+            device_auth_id,
+            user_code,
+            verification_uri: DEVICE_VERIFICATION_URL.into(),
+            interval,
+        })
+    }
+
+    /// One poll of an outstanding device-code flow. The caller owns the
+    /// interval / TTL loop (see `device_flow.rs`).
+    pub async fn poll_device_code(&self, device_auth_id: &str, user_code: &str) -> Result<DevicePoll, Error> {
+        let res = self
+            .client
+            .post(&self.device_token_url)
+            .header("content-type", "application/json")
+            .json(&json!({ "device_auth_id": device_auth_id, "user_code": user_code }))
+            .send()
+            .await?;
+        // 403/404 both mean "not approved yet" — codex-rs treats them
+        // identically rather than as an error.
+        if res.status() == reqwest::StatusCode::FORBIDDEN || res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(DevicePoll::Pending);
+        }
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            return Err(format!("device-code poll failed: {status} {body}").trim().into());
+        }
+        let Value::Object(body) = serde_json::from_slice::<Value>(&res.bytes().await?)? else {
+            return Err("device-code poll returned an unexpected payload".into());
+        };
+        let code = str_field(&body, "authorization_code")
+            .ok_or("device-code poll response carried no authorization_code")?
+            .to_string();
+        let code_verifier = str_field(&body, "code_verifier")
+            .ok_or("device-code poll response carried no code_verifier")?
+            .to_string();
+        Ok(DevicePoll::Authorized { code, code_verifier })
+    }
+
+    /// Redeem an authorized device-code grant for tokens and write them
+    /// to the credentials file — creating it if this is a first-ever
+    /// sign-in. Unlike `rotate`, an unreadable or missing file is not an
+    /// error here: it just means there is nothing to preserve.
+    pub async fn install_from_device_code(
+        &self,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<Credentials, Error> {
+        let _guard = self.lock.lock().await;
+        let res = self
+            .client
+            .post(&self.token_url)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", DEVICE_REDIRECT_URI),
+                ("client_id", CODEX_CLIENT_ID),
+                ("code_verifier", code_verifier),
+            ])
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            return Err(format!("device-code token exchange failed: {status} {body}")
+                .trim()
+                .into());
+        }
+        let exchanged = match serde_json::from_slice::<Value>(&res.bytes().await?) {
+            Ok(Value::Object(m)) if str_field(&m, "access_token").is_some() => m,
+            _ => return Err("device-code token exchange returned an unexpected payload".into()),
+        };
+
+        let mut auth = self.read_file().await.unwrap_or_default();
+        let mut tokens = auth
+            .get("tokens")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for key in ["access_token", "refresh_token", "id_token"] {
+            if let Some(v) = str_field(&exchanged, key) {
+                tokens.insert(key.into(), json!(v));
+            }
+        }
+        let from = str_field(&tokens, "id_token").or_else(|| str_field(&tokens, "access_token"));
+        match from.and_then(account_id_from_claims) {
+            Some(id) => {
+                tokens.insert("account_id".into(), json!(id));
+            }
+            None => {
+                tokens.remove("account_id");
+            }
+        }
+        auth.insert("tokens".into(), Value::Object(tokens.clone()));
+        auth.insert("last_refresh".into(), json!(iso_now()));
+        self.write_file(&auth).await?;
+        println!(
+            "[auth] signed in via device code, saved to {}",
+            self.path.display()
+        );
+        Ok(credentials_of(&tokens))
     }
 }
 

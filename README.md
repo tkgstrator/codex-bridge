@@ -108,6 +108,34 @@ curl -s localhost:3000/usage | jq .rate_limit.primary_window
 - モデルは ChatGPT アカウントで使えるもののみ (`gpt-5.6-luna`, `gpt-5.5` など)。正確な一覧は `GET /models?client_version=0.154.0` で取れます
 - レスポンスは SSE ですが `Content-Type: text/event-stream` が付かないことがあります
 
+## MCP (codex-mcp)
+
+`codex-bridge` とは別のバイナリ `codex-mcp` として、Claude Code などのMCPクライアントから直接Codexバックエンドを呼べる標準入出力 (stdio) MCPサーバーを同梱しています。`codex-bridge` のHTTPプロセスは不要で、`~/.codex/auth.json` を直接読み書きして認証します。
+
+```sh
+cargo build --release --bin codex-mcp
+claude mcp add codex -- $(pwd)/target/release/codex-mcp
+```
+
+環境変数 (すべて任意):
+
+| 変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `CODEX_AUTH_PATH` | `~/.codex/auth.json` | 認証情報ファイル (codex-bridgeと共通) |
+| `CODEX_UPSTREAM` | `https://chatgpt.com/backend-api/codex` | 転送先 (codex-bridgeと共通) |
+| `CODEX_CLI_VERSION` | `0.0.0` | `User-Agent: codex_cli/<ver>` に使うバージョン (codex-bridgeと共通) |
+| `CODEX_MCP_DEFAULT_MODEL` | `gpt-5.6-luna` | `ask_codex` の `model` 省略時のデフォルト |
+
+### 公開しているツール
+
+| ツール | 説明 |
+| --- | --- |
+| `ask_codex` | `prompt` (必須) / `model` / `instructions` を受け取り、`POST /responses` (`stream: true`, `store: false`) を呼んで最終的なテキスト回答を返す |
+| `generate_image` | `prompt` (必須) / `size` / `background` を受け取り、`POST /images/generations` を呼んで生成された画像 (PNG) を返す。このエンドポイントは `model` フィールドを検証・使用しない (デタラメな文字列や空文字、省略でも常に同じ画像モデルが動く。本家 `api.openai.com` とは別物のChatGPT内部専用エンドポイントで、選べるモデルという概念自体が無い) ため、`model` は送っていない |
+| `list_models` | `client_version` (省略可、既定は `CODEX_CLI_VERSION`) を受け取り、`GET /models` を呼ぶ。`visibility: "hide"` のモデルと、各モデルが持つ巨大なシステムプロンプトテンプレート系フィールド (シリアライズ後 4096 byte 超のフィールドを一律除外、実測で `model_messages` や `base_instructions` など) を取り除いた軽量なカタログを返す (実測で約36万文字→1万文字程度まで縮む) |
+
+401時は codex-bridge と同様にトークンを一度だけリフレッシュしてリトライします。
+
 ## Docker
 
 ```sh

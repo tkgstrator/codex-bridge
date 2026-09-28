@@ -8,9 +8,13 @@
 //! expiry, and once more on an upstream 401, plus an optional API key
 //! on the client side (BRIDGE_API_KEY).
 
-mod auth;
+mod device_flow;
+
+// Shared with the lib crate's auth.rs tests; this binary's own tests
+// only exercise a subset of these fixtures.
 #[cfg(test)]
 #[path = "__tests__/support.rs"]
+#[allow(dead_code)]
 mod support;
 
 use std::sync::Arc;
@@ -19,13 +23,21 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 
-use auth::TokenStore;
+use codex_bridge::auth::{self, DevicePoll, TokenStore};
+use codex_bridge::{env_or, Error};
+use device_flow::{DeviceFlowStore, Phase};
 
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
+// Paths reachable without BRIDGE_API_KEY. `/health` so a load balancer
+// (which cannot attach a key) can still probe liveness; `/auth` so the
+// device-code sign-in page itself can be opened in a bare browser tab —
+// the page is static and touches no credentials. The two endpoints it
+// calls (`/auth/device/start`, `/auth/device/poll`), which do, stay
+// behind the guard like everything else.
+const OPEN_PATHS: &[&str] = &["/health", "/auth"];
 
 struct App {
     client: reqwest::Client,
@@ -35,6 +47,7 @@ struct App {
     tokens: TokenStore,
     /// Keys a caller may present. Empty = the bridge is unauthenticated.
     api_keys: Vec<String>,
+    device_flows: DeviceFlowStore,
 }
 
 // Hop-by-hop and connection-specific headers that must not be relayed
@@ -59,17 +72,19 @@ const STRIP_REQUEST_HEADERS: &[&str] = &[
 ];
 const STRIP_RESPONSE_HEADERS: &[&str] = &["content-length", "transfer-encoding", "connection"];
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.into())
-}
-
 fn json_error(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "error": { "message": message, "type": "bridge_error" } });
     (
         status,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+fn json_ok(body: serde_json::Value) -> Response {
+    (
+        StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
     )
@@ -130,9 +145,11 @@ fn authorized(app: &App, headers: &HeaderMap) -> bool {
 
 // `/health` is left open so a load balancer — which cannot attach a key
 // to its health check — can still probe it; the handler withholds the
-// account details from unauthenticated callers.
+// account details from unauthenticated callers. `/auth` (the device-code
+// sign-in page) is open for the same reason a login page has to be: it
+// is what gets a caller their first key. See `OPEN_PATHS`.
 async fn guard(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
-    if req.uri().path() == "/health" || authorized(&app, req.headers()) {
+    if OPEN_PATHS.contains(&req.uri().path()) || authorized(&app, req.headers()) {
         return next.run(req).await;
     }
     println!("[proxy] {} {} -> 401 (bridge)", req.method(), req.uri().path());
@@ -300,6 +317,92 @@ async fn refresh(State(app): State<Arc<App>>) -> Response {
     }
 }
 
+// --- device-code sign-in (`GET /auth`) ----------------------------------
+
+async fn auth_page() -> Html<&'static str> {
+    Html(include_str!("auth_page.html"))
+}
+
+async fn device_start(State(app): State<Arc<App>>) -> Response {
+    let code = match app.tokens.request_device_code().await {
+        Ok(code) => code,
+        Err(err) => return json_error(StatusCode::BAD_GATEWAY, &err.to_string()),
+    };
+    let (flow_id, expires_at) = app.device_flows.create(&code).await;
+    let ttl = expires_at.saturating_duration_since(tokio::time::Instant::now());
+    json_ok(serde_json::json!({
+        "flowId": flow_id,
+        "userCode": code.user_code,
+        "verificationUri": code.verification_uri,
+        "expiresAt": unix_secs(std::time::SystemTime::now()) + ttl.as_secs(),
+        "intervalSeconds": code.interval.as_secs(),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct DevicePollRequest {
+    #[serde(rename = "flowId")]
+    flow_id: String,
+}
+
+// Mirrors the shape of the flow the WebUI drives: the browser polls on
+// its own timer, but only a fraction of those calls actually reach
+// auth.openai.com — `DeviceFlowStore` throttles by the vendor's own
+// `interval` regardless of how eagerly the client asks.
+async fn device_poll(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let Ok(req) = serde_json::from_slice::<DevicePollRequest>(&body) else {
+        return json_error(StatusCode::BAD_REQUEST, "missing flowId");
+    };
+    let Some(flow) = app.device_flows.get(&req.flow_id).await else {
+        return json_ok(serde_json::json!({ "status": "expired" }));
+    };
+    match flow.phase {
+        Phase::Connected => return json_ok(serde_json::json!({ "status": "connected" })),
+        Phase::Completing => return json_ok(serde_json::json!({ "status": "pending" })),
+        Phase::Polling => {}
+    }
+    let now = tokio::time::Instant::now();
+    if now >= flow.expires_at {
+        app.device_flows.delete(&req.flow_id).await;
+        return json_ok(serde_json::json!({ "status": "expired" }));
+    }
+    if now < flow.next_poll_at {
+        return json_ok(serde_json::json!({ "status": "pending" }));
+    }
+
+    // Claimed before the upstream call, not after: a poll arriving while
+    // this one is still waiting on auth.openai.com must answer `pending`
+    // from memory, or both could reach upstream and the single-use code
+    // would be exchanged twice.
+    app.device_flows.mark_polled(&req.flow_id).await;
+    match app
+        .tokens
+        .poll_device_code(&flow.device_auth_id, &flow.user_code)
+        .await
+    {
+        Ok(DevicePoll::Pending) => json_ok(serde_json::json!({ "status": "pending" })),
+        Ok(DevicePoll::Authorized { code, code_verifier }) => {
+            app.device_flows.set_phase(&req.flow_id, Phase::Completing).await;
+            match app.tokens.install_from_device_code(&code, &code_verifier).await {
+                Ok(_) => {
+                    app.device_flows.set_phase(&req.flow_id, Phase::Connected).await;
+                    json_ok(serde_json::json!({ "status": "connected" }))
+                }
+                Err(err) => {
+                    // The grant's code is single-use and already spent;
+                    // there is nothing left to retry on this flow.
+                    app.device_flows.delete(&req.flow_id).await;
+                    json_error(StatusCode::BAD_GATEWAY, &err.to_string())
+                }
+            }
+        }
+        Err(err) => {
+            app.device_flows.delete(&req.flow_id).await;
+            json_error(StatusCode::BAD_GATEWAY, &err.to_string())
+        }
+    }
+}
+
 // `codex-bridge --health`: probe the running server and exit 0/1, so a
 // Docker HEALTHCHECK works inside distroless where there is no curl.
 async fn health_probe(port: u16) -> Result<(), Error> {
@@ -315,6 +418,9 @@ fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/refresh", post(refresh))
+        .route("/auth", get(auth_page))
+        .route("/auth/device/start", post(device_start))
+        .route("/auth/device/poll", post(device_poll))
         .fallback(handle)
         // `layer` (not `route_layer`) so the fallback — i.e. everything
         // that gets proxied — is guarded too.
@@ -362,6 +468,7 @@ async fn main() -> Result<(), Error> {
         user_agent,
         tokens,
         api_keys,
+        device_flows: DeviceFlowStore::new(),
     });
     let router = router(app);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
