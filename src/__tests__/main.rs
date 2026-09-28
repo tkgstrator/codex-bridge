@@ -317,6 +317,7 @@ async fn unreachable_upstream_yields_502() {
         user_agent: USER_AGENT.into(),
         tokens: auth::TokenStore::with_token_url(file.path.clone(), "http://127.0.0.1:1".into(), client),
         api_keys: Vec::new(),
+        device_flows: DeviceFlowStore::new(),
     });
     let addr = spawn(router(app)).await;
     let res = reqwest::get(format!("http://{addr}/models")).await.unwrap();
